@@ -1,1 +1,2 @@
-from __future__ import annotations\n\n# TODO: implement
+from __future__ import annotations
+# TODO: implement

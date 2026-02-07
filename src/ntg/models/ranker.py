@@ -59,6 +59,8 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
     # Optional graph (do NOT fail tests if missing)
     graph_available = cfg.graph_path.exists()
 
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     log("Connecting DuckDB (in-memory)")
     con = duckdb.connect(database=":memory:")
     con.execute(f"PRAGMA threads={cfg.threads};")
@@ -113,6 +115,18 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
             """
         )
         con.execute("CREATE OR REPLACE VIEW graph AS SELECT * FROM graph;")
+
+    # ---------------------------------------------------------------------
+    # Leakage guard: "seen" means ANY TRAIN interaction (not just positives)
+    # ---------------------------------------------------------------------
+    log("Building user_seen (TRAIN-only, all ratings)")
+    con.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE user_seen AS
+        SELECT DISTINCT user_id, item_id
+        FROM train;
+        """
+    )
 
     # Popularity prior (TRAIN-only)
     log("Computing item popularity prior (TRAIN-only)")
@@ -183,7 +197,8 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
         """
     )
 
-    # Popularity fallback list
+    # Popularity fallback list (make it larger so after excluding seen items we still fill Top-K)
+    pop_pool_limit = int(cfg.candidates_per_user + cfg.max_hist_items_per_user + cfg.k)
     log("Preparing popularity fallback list")
     con.execute(
         f"""
@@ -191,7 +206,7 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
         SELECT item_id, pop_log
         FROM item_pop_norm
         ORDER BY pop_log DESC, item_id ASC
-        LIMIT {cfg.candidates_per_user};
+        LIMIT {pop_pool_limit};
         """
     )
 
@@ -216,8 +231,8 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
                 FROM neigh n
                 WHERE NOT EXISTS (
                     SELECT 1
-                    FROM user_hist h
-                    WHERE h.user_id = n.user_id AND h.item_id = n.cand_item
+                    FROM user_seen s
+                    WHERE s.user_id = n.user_id AND s.item_id = n.cand_item
                 )
             ),
             with_pop AS (
@@ -273,15 +288,11 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
     if not graph_available:
         con.execute(
             f"""
-            CREATE OR REPLACE TEMP TABLE topk AS
+            CREATE OR REPLACE TEMP TABLE topk_raw AS
             SELECT
                 e.user_id,
                 p.item_id,
-                p.pop_log AS score,
-                ROW_NUMBER() OVER (
-                    PARTITION BY e.user_id
-                    ORDER BY p.pop_log DESC, p.item_id ASC
-                ) AS rank
+                p.pop_log AS score
             FROM eligible e
             JOIN pop_fallback p ON TRUE;
             """
@@ -289,7 +300,7 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
     else:
         con.execute(
             f"""
-            CREATE OR REPLACE TEMP TABLE topk AS
+            CREATE OR REPLACE TEMP TABLE topk_raw AS
             WITH pool_or_pop AS (
                 -- popularity fallback for low-history users
                 SELECT
@@ -312,18 +323,41 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
                   ON e.user_id = c.user_id
                 WHERE e.n_hist >= {cfg.min_user_hist}
             )
-            SELECT
-                user_id,
-                item_id,
-                score,
-                ROW_NUMBER() OVER (
-                    PARTITION BY user_id
-                    ORDER BY score DESC, item_id ASC
-                ) AS rank
-            FROM pool_or_pop;
+            SELECT * FROM pool_or_pop;
             """
         )
 
+    # ---------------------------------------------------------------------
+    # FINAL LEAKAGE GATE (Netflix/FAANG-style): remove ALL TRAIN-seen items
+    # ---------------------------------------------------------------------
+    log("Applying final leakage gate (exclude ALL TRAIN-seen items)")
+    con.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE topk_noseen AS
+        SELECT r.*
+        FROM topk_raw r
+        WHERE NOT EXISTS (
+            SELECT 1 FROM user_seen s
+            WHERE s.user_id = r.user_id AND s.item_id = r.item_id
+        );
+        """
+    )
+
+    # Rank and slice to K
+    con.execute(
+        f"""
+        CREATE OR REPLACE TEMP TABLE topk AS
+        SELECT
+            user_id,
+            item_id,
+            score,
+            ROW_NUMBER() OVER (
+                PARTITION BY user_id
+                ORDER BY score DESC, item_id ASC
+            ) AS rank
+        FROM topk_noseen;
+        """
+    )
     con.execute(
         f"""
         CREATE OR REPLACE TEMP TABLE topk_k AS
@@ -332,6 +366,38 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
         WHERE rank <= {cfg.k};
         """
     )
+
+    # Health / coverage metrics (observability)
+    log("Computing health metrics (coverage, empty users, rec counts)")
+    health_row = con.execute(
+        f"""
+        WITH per_user AS (
+          SELECT user_id, COUNT(*) AS n_recs
+          FROM topk_k
+          GROUP BY user_id
+        ),
+        u AS (
+          SELECT COUNT(DISTINCT user_id) AS n_users FROM eligible
+        )
+        SELECT
+          (SELECT n_users FROM u) AS n_users,
+          (SELECT COUNT(*) FROM per_user WHERE n_recs >= {cfg.k}) AS users_with_k,
+          (SELECT COUNT(*) FROM per_user WHERE n_recs = 0) AS users_with_0,
+          (SELECT AVG(n_recs) FROM per_user) AS avg_recs_per_user,
+          (SELECT MIN(n_recs) FROM per_user) AS min_recs_per_user,
+          (SELECT MAX(n_recs) FROM per_user) AS max_recs_per_user
+        """
+    ).fetchone()
+
+    health = {
+        "n_users": int(health_row[0] or 0),
+        "users_with_k": int(health_row[1] or 0),
+        "users_with_0": int(health_row[2] or 0),
+        "avg_recs_per_user": float(health_row[3] or 0.0),
+        "min_recs_per_user": int(health_row[4] or 0),
+        "max_recs_per_user": int(health_row[5] or 0),
+        "pct_users_with_k": float((health_row[1] or 0) / (health_row[0] or 1)),
+    }
 
     log(f"Writing: {cfg.out_topk_path}")
     con.execute(
@@ -345,9 +411,32 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
         """
     )
 
+    # Load output and enforce hard contracts (fail fast)
+    topk_df = pd.read_parquet(cfg.out_topk_path)
+
+    if topk_df.empty:
+        raise AssertionError("topk.parquet is empty — pipeline produced no recommendations")
+
+    required = {"user_id", "item_id", "score", "rank"}
+    missing = required - set(topk_df.columns)
+    if missing:
+        raise AssertionError(f"topk.parquet missing columns: {sorted(missing)}")
+
+    # Rank sanity
+    if topk_df["rank"].min() != 1:
+        raise AssertionError("Ranks should start at 1 per user")
+    if (topk_df["rank"] > cfg.k).any():
+        raise AssertionError("Found rank > k in output")
+
+    # Leakage sanity: ensure none of the recommended pairs are in TRAIN
+    train_df = pd.read_parquet(cfg.train_path)[["user_id", "item_id"]]
+    seen = set(map(tuple, train_df.values))
+    leak = sum((u, i) in seen for u, i in map(tuple, topk_df[["user_id", "item_id"]].values))
+    if leak != 0:
+        raise AssertionError(f"Leakage detected: {leak} recommended items appear in TRAIN")
+
     # Offline eval on VAL (requires your metrics.py to exist)
     log("Evaluating on VAL")
-    topk_df = pd.read_parquet(cfg.out_topk_path)
     gt_val = pd.read_parquet(cfg.val_path)[["user_id", "item_id"]].copy()
 
     from ntg.evaluation.metrics import RankingMetricsConfig, evaluate_topk
@@ -359,6 +448,8 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
     )
 
     report = {
+        "run_id": run_id,
+        "model_version": "ranker_v1",
         "split": "val",
         "k": cfg.k,
         "candidates_per_user": cfg.candidates_per_user,
@@ -372,17 +463,19 @@ def build_topk_and_eval(cfg: RankerConfig) -> None:
             "memory_limit": cfg.memory_limit,
             "tmp_dir": str(cfg.tmp_dir),
         },
+        "health": health,
         "metrics": metrics,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "notes": (
-            "Leakage-safe: TRAIN-only history; popularity fallback always available. "
-            "Deterministic ordering (no RANDOM)."
+            "Leakage-safe: TRAIN-only history/popularity. Final leakage gate excludes ALL TRAIN-seen "
+            "items (not just positive history). Deterministic ordering (no RANDOM). Includes health "
+            "metrics and hard contracts."
         ),
     }
 
     cfg.out_metrics_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    log(f"✅ Wrote: {cfg.out_topk_path}")
-    log(f"✅ Wrote: {cfg.out_metrics_path}")
+    log(f"Wrote: {cfg.out_topk_path}")
+    log(f"Wrote: {cfg.out_metrics_path}")
 
 
 def main() -> None:
